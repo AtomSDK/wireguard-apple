@@ -9,12 +9,18 @@ import WireGuardKitGo
 import WireGuardKitC
 #endif
 
+public enum WireGuardAdapterErrorInvalidStateReason: String {
+    case alreadyStarted
+    case alreadyStopped
+    case updatedTunnelWhileStopped
+}
+
 public enum WireGuardAdapterError: Error {
     /// Failure to locate tunnel file descriptor.
     case cannotLocateTunnelFileDescriptor
 
     /// Failure to perform an operation in such state.
-    case invalidState
+    case invalidState(WireGuardAdapterErrorInvalidStateReason)
 
     /// Failure to resolve endpoints.
     case dnsResolution([DNSResolutionError])
@@ -36,6 +42,15 @@ private enum State {
 
     /// The tunnel is temporarily shutdown due to device going offline
     case temporaryShutdown(_ settingsGenerator: PacketTunnelSettingsGenerator)
+    
+    case snoozing
+
+    var canStartAdapter: Bool {
+        switch self {
+        case .stopped, .snoozing: return true
+        case .started, .temporaryShutdown: return false
+        }
+    }
 }
 
 public class WireGuardAdapter {
@@ -176,8 +191,8 @@ public class WireGuardAdapter {
     ///   - completionHandler: completion handler.
     public func start(tunnelConfiguration: TunnelConfiguration, completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         workQueue.async {
-            guard case .stopped = self.state else {
-                completionHandler(.invalidState)
+            guard self.state.canStartAdapter else {
+                completionHandler(.invalidState(.alreadyStarted))
                 return
             }
 
@@ -217,11 +232,11 @@ public class WireGuardAdapter {
             case .started(let handle, _):
                 wgTurnOff(handle)
 
-            case .temporaryShutdown:
+            case .temporaryShutdown, .snoozing:
                 break
 
             case .stopped:
-                completionHandler(.invalidState)
+                completionHandler(.invalidState(.alreadyStopped))
                 return
             }
 
@@ -233,6 +248,31 @@ public class WireGuardAdapter {
             completionHandler(nil)
         }
     }
+    
+    public func snooze(completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
+            workQueue.async {
+                switch self.state {
+                case .started(let handle, _):
+                    wgTurnOff(handle)
+
+                case .temporaryShutdown, .snoozing:
+                    break
+
+                case .stopped:
+                    completionHandler(.invalidState(.alreadyStopped))
+                    return
+                }
+
+                self.networkMonitor?.cancel()
+                self.networkMonitor = nil
+
+                self.state = .snoozing
+
+                try? self.setNetworkSettings(nil)
+
+                completionHandler(nil)
+            }
+        }
 
     /// Update runtime configuration.
     /// - Parameters:
@@ -241,7 +281,7 @@ public class WireGuardAdapter {
     public func update(tunnelConfiguration: TunnelConfiguration, completionHandler: @escaping (WireGuardAdapterError?) -> Void) {
         workQueue.async {
             if case .stopped = self.state {
-                completionHandler(.invalidState)
+                completionHandler(.invalidState(.updatedTunnelWhileStopped))
                 return
             }
 
@@ -271,7 +311,8 @@ public class WireGuardAdapter {
 
                 case .temporaryShutdown:
                     self.state = .temporaryShutdown(settingsGenerator)
-
+                case .snoozing:
+                    assertionFailure("Attempted to update WireGuard adapter while snoozing")
                 case .stopped:
                     fatalError()
                 }
@@ -311,7 +352,7 @@ public class WireGuardAdapter {
     ///   - networkSettings: an instance of type `NEPacketTunnelNetworkSettings`.
     /// - Throws: an error of type `WireGuardAdapterError`.
     /// - Returns: `PacketTunnelSettingsGenerator`.
-    private func setNetworkSettings(_ networkSettings: NEPacketTunnelNetworkSettings) throws {
+    private func setNetworkSettings(_ networkSettings: NEPacketTunnelNetworkSettings?) throws {
         var systemError: Error?
         let condition = NSCondition()
 
@@ -456,7 +497,7 @@ public class WireGuardAdapter {
                 self.logHandler(.error, "Failed to restart backend: \(error.localizedDescription)")
             }
 
-        case .stopped:
+        case .stopped, .snoozing:
             // no-op
             break
         }
